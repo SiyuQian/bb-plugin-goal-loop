@@ -42,7 +42,7 @@ bb plugin install git:https://github.com/SiyuQian/bb-plugin-goal-loop.git@^0.2.0
 
 ## 输入框上方的卡片
 
-有 goal 且尚未完成时，卡片显示状态和轮次。展开可查看目标、障碍和状态说明。
+有 goal 且尚未完成时，输入框上方的条显示状态、轮次、目标、Pause 或 Resume 和关闭按钮。目标过长时悬停可看全文。障碍和状态说明显示在条下方。
 
 - `active` 显示 **Pause**；`paused` 和 `blocked` 显示 **Resume**。
 - `budgetLimited` 要通过 `bb goal resume --max-rounds <n>` 提高轮数上限后恢复。

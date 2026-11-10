@@ -59,8 +59,10 @@ instructions are sent to the agent.
 
 ## Goal card
 
-A card above the thread's composer shows every goal except a completed one.
-Expand it to see the objective, blocker, and status note.
+A bar above the thread's composer shows every goal except a completed one. The
+bar shows the status, round, objective, Pause or Resume, and the close button.
+Hover the objective to see all of it. A blocker or status note shows under the
+bar.
 
 - Active goals have **Pause**. Paused and blocked goals have **Resume**.
 - A goal that used all its rounds needs `bb goal resume --max-rounds <n>`.

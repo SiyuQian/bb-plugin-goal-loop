@@ -15,7 +15,8 @@ time.
   default (`maxRounds`).
 - A user reply makes a blocked goal active again. Pressing Stop pauses the goal,
   and only Resume restarts a paused goal.
-- The composer card has Pause, Resume, and a close button that clears the goal.
+- The bar above the composer shows the objective, Pause or Resume, and a close
+  button that clears the goal.
   CLI commands include `bb goal status`, `pause`, `resume`, and `clear`.
 
 ## Scope
