@@ -1,65 +1,47 @@
 ---
 name: goal
-description: "Inspect task preflight and manage a thread's plugin goal with bb goal. Use for a held request, goal preparation, round count, or a goal that stopped."
+description: "Inspect and manage a thread's Goal Loop goal with bb goal. Use for a goal's round count, a blocked or paused goal, or how a goal starts."
 ---
 
 # Goal
 
-Each new task passes through a preflight workflow before normal dispatch,
-including later tasks in an existing thread. Assessment is read-only. Work
-estimated or suspected to need at least 15 minutes, or with uncertain scope,
-requires a goal. Finishing within one model turn is not an exemption.
+A goal keeps the agent working across rounds. No message is held before work
+starts. A goal starts in one of two ways:
 
-The server checks the worker's assessment against the stored original request
-and prepares the goal before it releases the request. The workflow's response
-alone cannot authorize release. Preserve the user's scope: a plan or design
-request does not authorize implementation. When a new thread's environment
-is not ready, a bootstrap controller runs this workflow; assessment workers
-do not perform the original task.
-
-The gate uses the public SDK's normal dispatch hook. Explicit Send now,
-editing and resending a message, and compaction do not pass through that hook.
-Do not claim the gate covers those paths.
+- The user picks **Send as goal** in the menu next to the composer's send
+  button. The message text becomes the objective.
+- The agent calls `goal_loop_create` before it ends a turn while requested work
+  remains, unless the next step needs a decision from the user. Do not start a
+  goal for a question, a plan or design discussion, or a choice the user must
+  make. Keep the objective within the user's scope: a request for a plan does
+  not include its implementation.
 
 ## Goal state and tools
 
-Codex and Claude use the same plugin round loop. Use `goal_loop_update` to
-mark this plugin's goal `complete` with evidence or report a blocker. Claude
-retains legacy `create_goal` and `update_goal`; the plugin does not expose
-those names to Codex. Native Codex goals are separate provider state, and an
-active native goal must not be silently replaced with a second plugin goal.
+Codex and Claude use the same tools: `goal_loop_create` and `goal_loop_update`.
+Use `goal_loop_update` to mark the goal `complete` with evidence or to report a
+blocker. Native Codex goals are separate provider state. Do not start a plugin
+goal while a native goal is active.
 
 | Status | Cause or action |
 |---|---|
-| `prepared` | Waiting for the original task to start, at round 1. Only clear/cancel is available; do not Resume. |
 | `active` | A completed turn starts the next round. |
 | `complete` | The entire objective is done and verified, with evidence. |
-| `blocked` | The same `blocker_key` was reported in 3 consecutive rounds. |
+| `blocked` | The same `blocker_key` was reported in 3 consecutive rounds. A user message makes it active again. |
 | `budgetLimited` | All rounds were used (default 256, setting `maxRounds`). |
-| `paused` | A turn was interrupted, or someone paused the goal. |
-
-A user message does not resume a paused goal. Only `bb goal resume` or the
-card's Resume button does. Clearing a prepared goal cancels preparation and
-keeps that original request from being released. A new user task can start
-a new preflight.
+| `paused` | A turn was interrupted, or someone paused the goal. Only Resume restarts it. |
 
 ## Commands
 
 Commands default to the current thread. Add `--thread <id>` for another one.
 
 ```sh
-bb goal status [--json]                 # this plugin's goal, not a native provider goal
-bb goal preflight-status --thread <id> # held request, state, and any preparation error
-bb goal preflight-retry --thread <id>  # retry a failed or cancelled assessment
+bb goal status [--json]           # this plugin's goal, not a native provider goal
 bb goal pause
 bb goal resume [--max-rounds <n>]
 bb goal clear
 ```
 
-`preflight-complete` is an internal workflow callback, invoked through
-`bb plugin run goal-loop preflight-complete ...`. Do not invoke it manually
-to bypass a held request or claim that a workflow reply released the task.
-
 To resume a round-limited goal, `--max-rounds` must exceed the current round.
-Prepared and complete goals cannot resume. Run resume only when the user
-asks. Do not pause, clear, or resume a goal to escape the round loop.
+A complete goal cannot resume. Run resume only when the user asks. Do not
+pause, clear, or resume a goal to escape the round loop.
