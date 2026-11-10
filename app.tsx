@@ -16,6 +16,7 @@ import {
 } from "./contract.ts";
 
 const TITLES: Record<GoalStatus, string> = {
+  prepared: "Goal preparing",
   active: "Goal",
   paused: "Goal paused",
   blocked: "Goal blocked",
@@ -45,10 +46,9 @@ function GoalCard({ threadId }: { threadId: string }) {
   if (goal === undefined || goal === null || goal.status === "complete") {
     return null;
   }
-  // A round-limited goal needs a new limit, so it gets no button. Its note
-  // names the CLI command.
+  // Preparation belongs to the preflight; Resume must not bypass its checks.
   const toggle = goal.status === "active" ? pause : resume;
-  const showToggle = goal.status !== "budgetLimited";
+  const showToggle = goal.status !== "budgetLimited" && goal.status !== "prepared";
   // A blocker counts only while its run of rounds can still continue.
   const blocker =
     goal.blocker !== null && goal.blocker.round >= goal.round - 1
@@ -61,7 +61,7 @@ function GoalCard({ threadId }: { threadId: string }) {
       icon="Target"
       isActive={goal.status === "active"}
       dismiss={{
-        label: "Clear goal",
+        label: goal.status === "prepared" ? "Cancel goal preparation" : "Clear goal",
         failureMessage: "Could not clear the goal.",
         onDismiss: async () => {
           await rpc.call("goal_clear", { threadId });

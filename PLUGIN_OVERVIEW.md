@@ -1,24 +1,32 @@
-Keep an agent working on a long-running objective without prompting it
-every turn.
+Prepare a goal before a long task starts, then keep its agent working across
+rounds without prompting it each time.
 
 ## What you get
 
-- Two agent tools. `create_goal` starts a goal when the user asks for
-  long-running work, even if the user does not say "goal". `update_goal`
-  ends it.
-- Automatic rounds: each time a turn completes, BB starts the next round,
-  up to 256 rounds by default (setting `maxRounds`).
-- Strict exits: "complete" needs evidence of verified work. "blocked" is
-  accepted only after the same blocker is reported in 3 consecutive rounds.
-- A card above the composer shows the thread's goal: its status, round, and
-  objective. Pause and Resume buttons control the round loop, and the close
-  button clears the goal.
-- Pressing Stop pauses the goal. `bb goal status`, `pause`, `resume`, and
-  `clear` manage it from a terminal.
+- A workflow checks each new task before normal dispatch, including later tasks
+  in the same thread. Assessment is read-only; a new thread without a ready
+  environment uses a bootstrap controller. It does not implement the task.
+- Work estimated or suspected to take at least 15 minutes, or whose estimate is
+  uncertain, needs a goal. Short questions and clear small changes can proceed
+  without one. Asking for a plan still authorizes only a plan.
+- The server validates the assessment against the original request and prepares
+  the goal before release. The workflow's reply cannot bypass that check.
+- A `Goal preparing` card shows preparation at round 1. It offers cancellation,
+  with no Resume action that could skip preparation.
+- Codex and Claude share the plugin round loop and `goal_loop_update` tool.
+  Completion needs evidence; a blocker needs 3 consecutive reports. Each
+  completed turn starts another round, up to 256 by default (`maxRounds`).
+- Active goals have Pause, paused or blocked goals have Resume, and the close
+  button clears the goal. Pressing Stop pauses it. CLI commands include
+  `bb goal status`, `preflight-status`, `pause`, `resume`, and `clear`.
 
 ## Scope
 
-Codex threads keep Codex's native goals. Child threads and threads that a
-plugin spawned (workflow workers, side chats) do not get the tools, because
-their caller reads each stop as the result. State lives in this
+This gate uses the public BB SDK. Normal dispatch waits for preflight, but
+explicit Send now, editing and resending a message, and compaction do not pass
+through the dispatch hook. These paths are outside the gate.
+
+Child threads and plugin-created threads such as workflow workers and side chats
+are excluded. Native Codex goals remain separate provider state; an active
+native goal is not silently replaced by a plugin goal. State lives in this
 plugin's storage on the BB server.

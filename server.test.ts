@@ -4,11 +4,24 @@ import { test } from "node:test";
 import {
   createFakePluginHost,
   makePluginAgentConfigurationContext,
+  makeMessageDispatchHookContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import plugin, { blockerStreak, type Goal } from "./server.ts";
 
 const THREAD = "thr_goal";
+
+test("holds a suspected large user task before any execution", async () => {
+  const { harness } = await start();
+  const hook = harness.inspection.registrations.hooks["message.dispatch"];
+  assert.ok(hook, "large tasks need an execution admission check");
+  const decision = await hook(makeMessageDispatchHookContext({
+    thread: { id: THREAD },
+    input: { text: "实现完整的多 PR 管理功能，包括前后端和端到端测试" },
+    initiator: "user",
+  }));
+  assert.equal(decision.action, "wait");
+});
 
 interface SentInput {
   input: Array<{ text: string; visibility?: string }>;
@@ -45,6 +58,7 @@ async function start(settings: Record<string, number> = {}) {
                 ]) as never,
         },
         get: async () => makeThreadResponse({ id: THREAD, ...thread }),
+        timeline: async () => ({ extensionStates: {} }) as never,
         send: async (args) => {
           sends.push(args as unknown as SentInput);
           return {} as never;
@@ -95,9 +109,9 @@ test("offers the tools to non-Codex threads that no plugin spawned", async () =>
     ).tools.map((tool) => tool.name);
   assert.deepEqual(await tools({ provider: { id: "claude-code" } }), [
     "create_goal",
-    "update_goal",
+    "goal_loop_update",
   ]);
-  assert.deepEqual(await tools({ provider: { id: "codex" } }), []);
+  assert.deepEqual(await tools({ provider: { id: "codex" } }), ["goal_loop_update"]);
   assert.deepEqual(
     await tools({ origin: { kind: "fork", pluginId: "side-chat" } }),
     [],

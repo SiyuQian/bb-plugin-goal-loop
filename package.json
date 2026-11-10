@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-goal-loop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Keeps an agent on a long-running goal: BB starts the next round each time the agent stops, until the goal is complete, blocked, or out of rounds.",
   "license": "MIT",
   "repository": {
@@ -22,7 +22,7 @@
     "app": "./app.tsx"
   },
   "scripts": {
-    "test": "node --test server.test.ts",
+    "test": "node --test *.test.ts",
     "typecheck": "tsc",
     "build": "bb plugin build"
   },

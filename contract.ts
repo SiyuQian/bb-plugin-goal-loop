@@ -8,8 +8,10 @@ export const BLOCKED_AFTER_ROUNDS = 3;
 
 export const goalSchema = z.object({
   objective: z.string(),
-  status: z.enum(["active", "paused", "blocked", "complete", "budgetLimited"]),
-  /** The round in progress. Round 1 is the turn that called create_goal. */
+  status: z.enum(["prepared", "active", "paused", "blocked", "complete", "budgetLimited"]),
+  /** Originating task identity; absent in goals stored by earlier releases. */
+  taskId: z.string().optional(),
+  /** The round in progress. A prepared goal waits at round 1 before work starts. */
   round: z.number(),
   maxRounds: z.number(),
   /** The latest blocker report and its run of consecutive rounds. */
