@@ -1,6 +1,6 @@
-// The goal card above a thread's composer. It shows while the thread has a
-// goal that is not complete, and refreshes when the server invalidates the
-// goal's RPC tag.
+// The goal card above a thread's composer, and the "Send as goal" row in the
+// send button's menu. The card shows while the thread has a goal that is not
+// complete, and refreshes when the server invalidates the goal's RPC tag.
 import {
   definePluginApp,
   experimental_CollapsibleStackCard as CollapsibleStackCard,
@@ -16,7 +16,6 @@ import {
 } from "./contract.ts";
 
 const TITLES: Record<GoalStatus, string> = {
-  prepared: "Goal preparing",
   active: "Goal",
   paused: "Goal paused",
   blocked: "Goal blocked",
@@ -46,9 +45,8 @@ function GoalCard({ threadId }: { threadId: string }) {
   if (goal === undefined || goal === null || goal.status === "complete") {
     return null;
   }
-  // Preparation belongs to the preflight; Resume must not bypass its checks.
   const toggle = goal.status === "active" ? pause : resume;
-  const showToggle = goal.status !== "budgetLimited" && goal.status !== "prepared";
+  const showToggle = goal.status !== "budgetLimited";
   // A blocker counts only while its run of rounds can still continue.
   const blocker =
     goal.blocker !== null && goal.blocker.round >= goal.round - 1
@@ -61,7 +59,7 @@ function GoalCard({ threadId }: { threadId: string }) {
       icon="Target"
       isActive={goal.status === "active"}
       dismiss={{
-        label: goal.status === "prepared" ? "Cancel goal preparation" : "Clear goal",
+        label: "Clear goal",
         failureMessage: "Could not clear the goal.",
         onDismiss: async () => {
           await rpc.call("goal_clear", { threadId });
@@ -107,7 +105,28 @@ function GoalCard({ threadId }: { threadId: string }) {
 export default definePluginApp((app) => {
   app.composer.customize({
     id: "goal",
-    scopes: ["thread"],
+    scopes: ["thread", "new-thread"],
     banners: [{ id: "goal", chrome: "bare", component: GoalBanner }],
+    sendMenu: [
+      {
+        id: "send-as-goal",
+        label: "Send as goal",
+        icon: "Target",
+        description:
+          "Send this message, then keep the agent working on it until it is done.",
+        disabled: (composer) =>
+          composer.text.trim() === "" || composer.isSubmittingBlocked,
+        // The server's message.dispatch hook sees this submission and starts the goal.
+        run: ({ composer }) =>
+          composer
+            .submit({
+              experimental_mode: "queue-if-active",
+              experimental_data: { goal: true },
+            })
+            // bb already showed a toast and restored the draft. A rejection
+            // here adds a second "Plugin action failed" toast.
+            .catch(() => undefined),
+      },
+    ],
   });
 });

@@ -1,11 +1,13 @@
 // bb-plugin-goal-loop: durable goals for agent threads.
 //
-// A preflight workflow prepares substantial tasks before execution; create_goal
-// remains available for explicit manual goals. Each time a turn completes, the plugin starts the
-// next round, up to the round limit (default 256). update_goal ends the loop:
-// "complete" needs evidence, and "blocked" is accepted only after the same
-// blocker_key is reported in 3 consecutive rounds. A turn that does not
-// complete (the user pressed Stop, a restart) pauses the goal.
+// A goal starts in one of two ways, and no message is ever held: the user
+// picks "Send as goal" in the composer's send menu, or the working agent calls
+// goal_loop_create when it would otherwise stop with requested work left.
+// Each time a turn completes, the plugin starts the next round, up to the
+// round limit (default 256). goal_loop_update ends the loop: "complete" needs
+// evidence, and "blocked" is accepted only after the same blocker_key is
+// reported in 3 consecutive rounds. A turn that does not complete (the user
+// pressed Stop, a restart) pauses the goal.
 import {
   PluginCliError,
   cliCommand,
@@ -15,7 +17,6 @@ import {
   type PluginCliContext,
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { registerPreflight, type WorkflowRunner } from "./preflight.ts";
 import {
   BLOCKED_AFTER_ROUNDS,
   goalTag,
@@ -25,13 +26,17 @@ import {
 
 export type { Goal } from "./contract.ts";
 
-const INSTRUCTIONS = `Goal mode (create_goal, goal_loop_update):
-- Goal Loop checks substantial tasks before execution. Tasks that may take 15 minutes receive a goal from the preflight workflow. Do not create another goal when one already exists.
-- Use create_goal only for a user-requested goal that has not already been prepared. Use goal_loop_update to update this plugin's goal. Do not use a provider's native goal tools for a plugin-controlled task.
-- The size of a task depends on its delivery steps, not whether one model turn can finish it. Keep the goal within the user's requested scope, including planning-only requests.
+const INSTRUCTIONS = `Goal mode (goal_loop_create, goal_loop_update):
 - While a goal is active, BB starts a new round each time you stop, up to the round limit. In each round, do the next concrete step. Do not wait for the user.
+- Do not create a second goal while one is unfinished. Do not use a provider's native goal tools for this plugin's goal.
 - Call goal_loop_update with status "complete" only when the whole objective is done and verified. Do not mark it complete to stop early, because rounds are running out, or while work remains.
 - Call goal_loop_update with status "blocked" only for an obstacle that stops all progress. BB accepts it only after the same blocker_key is reported in ${BLOCKED_AFTER_ROUNDS} consecutive rounds. Before you report the same blocker again, try a different approach.`;
+
+/** Sent while autoGoal is on and the thread has no unfinished goal. */
+export const AUTO_START = `Goal Loop: when your turn ends, the work stops until the user sends a message, unless this thread has a goal. A goal makes BB start your next turn automatically.
+- Before you end a turn while work the user asked for remains, call goal_loop_create. If the tool's schema is not loaded, load it first.
+- Do not ask the user whether to continue.
+- Do not create a goal when the next step needs a decision from the user, or for a question, a plan or design discussion, or a choice the user must make.`;
 
 export function normalizeBlockerKey(key: string): string {
   return key
@@ -103,12 +108,12 @@ function toolError(text: string) {
   return { content: [{ type: "text" as const, text }], isError: true };
 }
 
-export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunner } = {}) {
+export default function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     autoGoal: {
       type: "boolean",
-      label: "Check tasks before execution",
-      description: "Run a preflight workflow before ambiguous or substantial tasks. Tasks that may take 15 minutes get a verified goal before execution.",
+      label: "Let the agent start goals",
+      description: "Tell the agent to start a goal instead of stopping while requested work remains. Send as goal works either way.",
       default: true,
     },
     maxRounds: {
@@ -152,38 +157,48 @@ export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunn
     return run;
   }
 
-  const preflight = registerPreflight(bb, {
-    read: load,
-    prepare: (threadId, taskId, objective, previousObjective) => locked(threadId, async () => {
+  // configure() is synchronous, so it reads this copy of the setting.
+  let autoGoal = true;
+  void settings.get().then((values) => { autoGoal = values.autoGoal; });
+  settings.onChange((next) => { autoGoal = next.autoGoal; });
+
+  async function nativeGoalActive(threadId: string): Promise<boolean> {
+    const timeline = await bb.sdk.threads.timeline({ threadId });
+    const goal = timeline.extensionStates?.["provider-codex/goal"] as { status?: string } | null | undefined;
+    return goal?.status === "active";
+  }
+
+  /** Starts an active goal at round 1, or returns why it cannot. */
+  function startGoal(threadId: string, objective: string): Promise<Goal | string> {
+    return locked(threadId, async () => {
       const current = await load(threadId);
-      if (current?.taskId === taskId && current.status === "prepared") return;
-      if (current && current.status !== "complete" && !(current.status === "active" && current.objective === previousObjective)) throw new PluginCliError("An unfinished goal already exists.", { code: "goal_conflict" });
-      await save(threadId, {
-        objective, taskId, status: "prepared", round: current?.status === "active" ? current.round : 1,
-        maxRounds: current?.status === "active" ? current.maxRounds : (await settings.get()).maxRounds,
-        blocker: null, note: "Goal prepared by the preflight workflow. The task is waiting for admission.",
-        lastTurnSeq: (await latestTurn(threadId))?.seq ?? 0,
-      });
-      return current?.status === "active" ? current : undefined;
-    }),
-    activate: (threadId, taskId) => locked(threadId, async () => {
-      const goal = await load(threadId);
-      if (goal?.taskId !== taskId || !["prepared", "active"].includes(goal.status)) throw new PluginCliError("Prepared goal no longer matches the task.", { code: "goal_conflict" });
-      if (goal.status === "active") return;
-      goal.status = "active"; goal.note = null;
-      goal.lastTurnSeq = (await latestTurn(threadId))?.seq ?? 0;
-      await save(threadId, goal);
-    }),
-    removePrepared: (threadId, taskId, previousGoal) => locked(threadId, async () => {
-      const goal = await load(threadId);
-      if (goal?.status === "prepared" && goal.taskId === taskId) {
-        if (previousGoal) {
-          await save(threadId, previousGoal);
-          void continueGoal(threadId);
-        } else await clear(threadId);
+      if (current && current.status !== "complete") {
+        return `This thread already has an unfinished goal (${current.status}, round ${current.round} of ${current.maxRounds}). Finish or clear it before you start another goal.`;
       }
-    }),
-  }, async () => (await settings.get()).autoGoal, options.runner);
+      if (await nativeGoalActive(threadId)) {
+        return "A native Codex goal is active on this thread. Clear it before you start a Goal Loop goal.";
+      }
+      const goal: Goal = {
+        objective,
+        status: "active",
+        round: 1,
+        maxRounds: (await settings.get()).maxRounds,
+        blocker: null,
+        note: null,
+        lastTurnSeq: (await latestTurn(threadId))?.seq ?? 0,
+      };
+      await save(threadId, goal);
+      return goal;
+    });
+  }
+
+  /** Makes a goal active again; its next round starts after the next turn ends. */
+  async function reactivate(threadId: string, goal: Goal): Promise<void> {
+    goal.status = "active";
+    goal.blocker = null;
+    goal.note = null;
+    goal.lastTurnSeq = (await latestTurn(threadId))?.seq ?? goal.lastTurnSeq;
+  }
 
   async function latestTurn(threadId: string) {
     const [row] = await bb.sdk.threads.events.list({
@@ -226,15 +241,39 @@ export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunn
     });
   }
 
+  /**
+   * Sends the saved goal's current round. Call it outside locked(): bb waits
+   * for the dispatch hook, and the hook takes the same lock. On failure the
+   * goal pauses, and the reason is returned.
+   */
+  async function startRound(threadId: string, goal: Goal): Promise<string | null> {
+    try {
+      await sendRound(threadId, goal);
+      return null;
+    } catch (error) {
+      const note = `Could not start round ${goal.round}: ${String(error)}`;
+      await locked(threadId, async () => {
+        const current = await load(threadId);
+        if (current?.status !== "active" || current.round !== goal.round) return;
+        current.round -= 1;
+        current.status = "paused";
+        current.note = note;
+        await save(threadId, current);
+      });
+      return note;
+    }
+  }
+
   /** Acts on a finished turn: start the next round, pause, or stop at the limit. */
   async function continueGoal(threadId: string): Promise<void> {
     if ((await load(threadId))?.status !== "active") return;
-    await locked(threadId, async () => {
+    const next = await locked(threadId, async () => {
       const goal = await load(threadId);
-      if (goal?.status !== "active") return;
+      if (goal?.status !== "active") return null;
       const turn = await latestTurn(threadId);
-      if (turn === null || turn.seq <= goal.lastTurnSeq) return;
+      if (turn === null || turn.seq <= goal.lastTurnSeq) return null;
       goal.lastTurnSeq = turn.seq;
+      let next: Goal | null = null;
       if (turn.status !== "completed") {
         goal.status = "paused";
         goal.note = `The last turn ended as "${turn.status}" (for example, the user pressed Stop). Resume it from the goal card or with "bb goal resume".`;
@@ -243,25 +282,20 @@ export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunn
         goal.note = `Used all ${goal.maxRounds} rounds. Run "bb goal resume --max-rounds <n>" to allow more.`;
       } else if (await canStartRound(threadId)) {
         goal.round += 1;
-        try {
-          await sendRound(threadId, goal);
-        } catch (error) {
-          goal.round -= 1;
-          goal.status = "paused";
-          goal.note = `Could not start round ${goal.round + 1}: ${String(error)}`;
-        }
+        next = goal;
       }
       // Otherwise another message already started a turn. When that turn
       // ends, the next idle event continues the goal.
       await save(threadId, goal);
+      return next;
     });
+    if (next !== null) await startRound(threadId, next);
   }
 
-  bb.agents.registerTool({
-    name: "create_goal",
+  function registerCreateTool(name: string) { bb.agents.registerTool({
+    name,
     description:
-      'Create an explicitly requested manual goal when no unfinished goal already exists. Substantial tasks normally receive a goal from the preflight workflow. BB continues the goal until goal_loop_update marks it complete or blocked, or the round limit is reached.',
-    instructions: INSTRUCTIONS,
+      "Start a goal for this thread when no unfinished goal exists. BB then starts a new round each time you stop, until goal_loop_update marks the goal complete or blocked, or the round limit is reached.",
     presentation: {
       label: { pending: "Creating goal", completed: "Created goal" },
     },
@@ -272,35 +306,22 @@ export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunn
         .min(1)
         .max(8000)
         .describe(
-          "The full objective in the user's terms, including what counts as done.",
+          "The full objective in the user's terms, including what counts as done. Keep the user's scope: a request for a plan or design does not include its implementation.",
         ),
     }),
     async execute({ objective }, { threadId }) {
-      return locked(threadId, async () => {
-        const current = await load(threadId);
-        if (current && current.status !== "complete") {
-          return toolError(
-            `This thread already has an active goal (round ${current.round} of ${current.maxRounds}). Keep working on it, and end it with update_goal. Objective:\n${quote(current.objective)}`,
-          );
-        }
-        const goal: Goal = {
-          objective,
-          status: "active",
-          round: 1,
-          maxRounds: (await settings.get()).maxRounds,
-          blocker: null,
-          note: null,
-          lastTurnSeq: (await latestTurn(threadId))?.seq ?? 0,
-        };
-        await save(threadId, goal);
-        return `Goal created. This is round 1 of ${goal.maxRounds}. Start the work now. Each time you stop, BB starts the next round until you call update_goal.`;
-      });
+      const goal = await startGoal(threadId, objective);
+      if (typeof goal === "string") return toolError(goal);
+      return `Goal created. This is round 1 of ${goal.maxRounds}. Start the work now. Each time you stop, BB starts the next round until you call goal_loop_update.`;
     },
-  });
+  }); }
+  registerCreateTool("create_goal"); // Existing Claude sessions may still call the old name.
+  registerCreateTool("goal_loop_create");
 
   function registerUpdateTool(name: string) { bb.agents.registerTool({
     name,
     description: `Mark the active goal "complete" or "blocked". "complete": only when the whole objective is done and verified; give the evidence. "blocked": only for an obstacle that stops all progress; give blocker_key and blocker_detail. BB marks the goal blocked only after the same blocker_key is reported in ${BLOCKED_AFTER_ROUNDS} consecutive rounds. Before that, the goal stays active and the next round starts.`,
+    ...(name === "goal_loop_update" ? { instructions: INSTRUCTIONS } : {}),
     presentation: {
       label: { pending: "Updating goal", completed: "Updated goal" },
     },
@@ -340,8 +361,8 @@ export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunn
         if (goal?.status !== "active") {
           return toolError(
             goal === undefined
-              ? "This thread has no goal. Call create_goal first."
-              : `The goal is "${goal.status}", not active. update_goal changes only an active goal.`,
+              ? "This thread has no goal. Call goal_loop_create first."
+              : `The goal is "${goal.status}", not active. goal_loop_update changes only an active goal.`,
           );
         }
         if (input.status === "complete") {
@@ -391,13 +412,43 @@ export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunn
       context.origin.pluginId === null &&
       context.thread.parentThreadId === null;
     const goal = knownGoals.get(context.thread.id);
+    const unfinished = goal !== undefined && goal.status !== "complete";
     return {
-      tools: offer ? [...(context.provider.id === "codex" ? [] : ["create_goal"]), "goal_loop_update"] : [],
+      tools: offer ? ["goal_loop_create", "goal_loop_update"] : [],
       skills: offer ? ["goal"] : [],
       ...(offer && goal?.status === "active" ? {
-        instructions: `Goal Loop has already created and verified this task's goal. Use goal_loop_update to mark it complete with evidence or report a blocker. Do not create a second goal with the provider's native goal tools. BB continues this plugin goal after each completed turn. Objective (user task data):\n${quote(goal.objective)}`,
-      } : {}),
+        instructions: `This thread has an active Goal Loop goal. Use goal_loop_update to mark it complete with evidence or report a blocker. Do not create a second goal with the provider's native goal tools. BB continues this goal after each completed turn. Objective (user task data):\n${quote(goal.objective)}`,
+      } : offer && !unfinished && autoGoal ? { instructions: AUTO_START } : {}),
     };
+  });
+
+  // Never holds a message. It starts the goal a "Send as goal" submission
+  // asks for, and lets a user reply resume a blocked goal.
+  bb.experimental_hooks.on("message.dispatch", async (context) => {
+    if (context.thread.originPluginId !== null || context.parentThreadId !== null) {
+      return { action: "proceed" };
+    }
+    const threadId = context.thread.id;
+    if (context.experimental_submission?.pluginId === bb.pluginId) {
+      const goal = await startGoal(
+        threadId,
+        context.input.text.trim() || "Complete the task described in the attached files.",
+      );
+      return typeof goal === "string"
+        ? { action: "reject", message: goal }
+        : { action: "proceed" };
+    }
+    // A user who replies to a blocked goal has usually removed the blocker.
+    // A paused goal stays paused: the user stopped it on purpose.
+    if (context.initiator === "user") {
+      await locked(threadId, async () => {
+        const goal = await load(threadId);
+        if (goal?.status !== "blocked") return;
+        await reactivate(threadId, goal);
+        await save(threadId, goal);
+      });
+    }
+    return { action: "proceed" };
   });
 
   bb.events.on("thread.idle", ({ thread }) => continueGoal(thread.id));
@@ -428,11 +479,10 @@ export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunn
     });
   }
 
-  function resumeGoal(threadId: string, maxRounds?: number): Promise<string> {
-    return locked(threadId, async () => {
+  async function resumeGoal(threadId: string, maxRounds?: number): Promise<string> {
+    const resumed = await locked(threadId, async () => {
       const goal = await requireGoal(threadId);
-      if (goal.status === "prepared") throw new PluginCliError("This goal is still preparing. Retry or cancel its preflight.", { code: "goal_preparing" });
-      if (goal.status === "active") return "The goal is already active.";
+      if (goal.status === "active") return { goal: null, message: "The goal is already active." };
       if (goal.status === "complete") {
         throw new PluginCliError("The goal is complete.", {
           code: "goal_complete",
@@ -446,19 +496,18 @@ export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunn
           hint: `Pass --max-rounds <n> with n greater than ${goal.round}.`,
         });
       }
-      goal.status = "active";
-      goal.blocker = null;
-      goal.note = null;
-      goal.lastTurnSeq = (await latestTurn(threadId))?.seq ?? goal.lastTurnSeq;
+      await reactivate(threadId, goal);
       if (await canStartRound(threadId)) {
         goal.round += 1;
-        await sendRound(threadId, goal);
         await save(threadId, goal);
-        return `Goal resumed. Round ${goal.round} of ${goal.maxRounds} started.`;
+        return { goal, message: `Goal resumed. Round ${goal.round} of ${goal.maxRounds} started.` };
       }
       await save(threadId, goal);
-      return "Goal resumed. The next round starts when the current turn ends.";
+      return { goal: null, message: "Goal resumed. The next round starts when the current turn ends." };
     });
+    const failed = resumed.goal === null ? null : await startRound(threadId, resumed.goal);
+    if (failed !== null) throw new PluginCliError(failed, { code: "round_failed" });
+    return resumed.message;
   }
 
   function refusal(error: unknown): never {
@@ -473,12 +522,8 @@ export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunn
 
   bb.rpc.register(rpcContract, {
     goal_get: async ({ threadId }) => (await load(threadId)) ?? null,
-    goal_clear: async ({ threadId }) => {
-      const current = await load(threadId);
-      await preflight.cancel(threadId);
-      if (current?.status === "prepared") return { cleared: true };
-      return locked(threadId, async () => ({ cleared: await clear(threadId) || current !== undefined }));
-    },
+    goal_clear: ({ threadId }) =>
+      locked(threadId, async () => ({ cleared: await clear(threadId) })),
     goal_pause: ({ threadId }) =>
       pauseGoal(threadId).then((message) => ({ message }), refusal),
     goal_resume: ({ threadId }) =>
@@ -508,35 +553,6 @@ export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunn
       name: "goal",
       summary: "Inspect, pause, resume, or clear a thread's goal",
       commands: {
-        "preflight-status": cliCommand({
-          summary: "Show the task's execution preflight, including workflow failures",
-          options: { thread: threadOption },
-          async run({ options }, ctx) {
-            return { exitCode: 0, stdout: JSON.stringify((await preflight.read(targetThread(options.thread, ctx))) ?? null) };
-          },
-        }),
-        "preflight-retry": cliCommand({
-          summary: "Retry a failed or cancelled task preflight",
-          options: { thread: threadOption },
-          async run({ options }, ctx) {
-            await preflight.retry(targetThread(options.thread, ctx));
-            return { exitCode: 0, stdout: "Preflight retry queued." };
-          },
-        }),
-        "preflight-complete": cliCommand({
-          summary: "Register a preflight workflow's assessment and prepare its goal",
-          options: {
-            thread: threadOption,
-            request: { type: "string", required: true, description: "Live preflight request id" },
-            decision: { type: "string", required: true, description: "JSON assessment from the workflow" },
-          },
-          async run({ options }, ctx) {
-            let decision: unknown;
-            try { decision = JSON.parse(options.decision); } catch { throw new PluginCliError("Decision must be valid JSON.", { code: "invalid_decision" }); }
-            const result = await preflight.complete(targetThread(options.thread, ctx), options.request, decision, ctx.threadId);
-            return { exitCode: 0, stdout: JSON.stringify(result) };
-          },
-        }),
         status: cliCommand({
           summary: "Show the thread's goal",
           options: {
@@ -591,9 +607,6 @@ export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunn
           options: { thread: threadOption },
           async run({ options }, ctx) {
             const threadId = targetThread(options.thread, ctx);
-            const current = await load(threadId);
-            await preflight.cancel(threadId);
-            if (current?.status === "prepared") return { exitCode: 0, stdout: "Goal preparation cancelled." };
             return locked(threadId, async () => {
               await clear(threadId);
               return { exitCode: 0, stdout: "Goal cleared." };
@@ -606,17 +619,40 @@ export default function plugin(bb: BbPluginApi, options: { runner?: WorkflowRunn
 
   // Idle events are not replayed while the plugin is unloaded. Catch up once:
   // continue or pause each active goal whose thread is idle now.
-  void (async () => {
+  bb.background.service("goal-recovery", { async start(signal) {
     for (const key of await bb.storage.kv.list("goal:")) {
+      if (signal.aborted) return;
       const threadId = key.slice("goal:".length);
       try {
-        if ((await load(threadId))?.status !== "active") continue;
-        knownGoals.set(threadId, (await load(threadId))!);
+        let goal = await load(threadId);
+        if (goal === undefined) continue;
+        // 0.1.1 "prepared" a goal before its task started, and the task may be
+        // long gone. Drop it, or give back the active goal it replaced.
+        if ((goal.status as string) === "prepared") {
+          goal = (await bb.storage.kv.get<{ previousGoal?: Goal }>(`preflight:${threadId}`))?.previousGoal;
+          if (goal === undefined) {
+            await clear(threadId);
+            continue;
+          }
+          await save(threadId, goal);
+        }
+        knownGoals.set(threadId, goal);
+        if (goal.status !== "active") continue;
         const thread = await bb.sdk.threads.get({ threadId });
         if (thread.status === "idle") await continueGoal(threadId);
       } catch (error) {
         bb.log.warn(`startup check failed for ${threadId}: ${String(error)}`);
       }
     }
-  })();
+    // 0.1.1 held tasks behind a preflight workflow. Archive its hidden
+    // controller threads, drop its records, and release what it still holds.
+    for (const key of await bb.storage.kv.list("preflight:")) {
+      const record = await bb.storage.kv.get<{ controllerId?: string | null }>(key);
+      if (record?.controllerId) {
+        await bb.sdk.threads.archive({ threadId: record.controllerId }).catch(() => undefined);
+      }
+      await bb.storage.kv.delete(key);
+    }
+    await bb.experimental_hooks.recheck("message.dispatch");
+  }});
 }
